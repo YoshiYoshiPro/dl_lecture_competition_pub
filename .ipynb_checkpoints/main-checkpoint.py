@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Any
 import os
 import time
+import matplotlib.pyplot as plt
 
 
 class RepresentationType(Enum):
@@ -43,6 +44,19 @@ def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     file_name: str => ファイル名
     '''
     np.save(f"{file_name}.npy", flow.cpu().numpy())
+    
+    
+def compute_multiscale_loss(pred_flows, gt_flow, gt_valid_mask):
+    total_loss = 0
+    weights = [0.32, 0.08, 0.02, 0.01]  # 各スケールの重み
+    for i, pred_flow in enumerate(pred_flows):
+        scale = 2 ** (3 - i)
+        scaled_gt_flow = F.interpolate(gt_flow, scale_factor=1/scale, mode='bilinear', align_corners=False)
+        scaled_gt_valid_mask = F.interpolate(gt_valid_mask.float(), scale_factor=1/scale, mode='nearest').bool()
+        loss = compute_epe_error(pred_flow, scaled_gt_flow) * weights[i]
+        total_loss += loss
+    return total_loss
+
 
 @hydra.main(version_base=None, config_path="configs", config_name="base")
 def main(args: DictConfig):
@@ -119,14 +133,15 @@ def main(args: DictConfig):
     # ------------------
     #   Start training
     # ------------------
+    epoch_losses = []
     model.train()
     for epoch in range(args.train.epochs):
         total_loss = 0
         print("on epoch: {}".format(epoch+1))
         for i, batch in enumerate(tqdm(train_data)):
             batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
-            ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
+            event_image = batch["event_volume"].to(device)
+            ground_truth_flow = batch["flow_gt"].to(device)
             flow = model(event_image) # [B, 2, 480, 640]
             loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
             print(f"batch {i} loss: {loss.item()}")
@@ -135,7 +150,10 @@ def main(args: DictConfig):
             optimizer.step()
 
             total_loss += loss.item()
-        print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
+
+        avg_loss = total_loss / len(train_data)
+        epoch_losses.append(avg_loss)
+        print(f'Epoch {epoch+1}, Average Loss: {avg_loss}')
 
     # Create the directory if it doesn't exist
     if not os.path.exists('checkpoints'):
@@ -165,6 +183,21 @@ def main(args: DictConfig):
     # ------------------
     file_name = "submission"
     save_optical_flow_to_npy(flow, file_name)
+    
+    # トレーニング終了後に損失をプロット
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(1, len(epoch_losses) + 1), epoch_losses, marker='o')
+    plt.title('Training Loss per Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('Average Loss')
+    plt.grid(True)
+    plt.savefig('training_loss.png')
+    plt.close()
+    
+    # 損失の値をテキストファイルに保存
+    with open('training_loss.txt', 'w') as f:
+        for epoch, loss in enumerate(epoch_losses, 1):
+            f.write(f'Epoch {epoch}: {loss}\n')
 
 if __name__ == "__main__":
     main()
