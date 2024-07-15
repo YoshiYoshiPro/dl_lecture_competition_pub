@@ -1,0 +1,2 @@
+[2024-07-15 11:26:39,789][__main__][INFO] - Using device: cuda
+[2024-07-15 11:40:24,392][__main__][INFO] - Epoch 1, Train Loss: 1.6836, Val Loss: 1.1805

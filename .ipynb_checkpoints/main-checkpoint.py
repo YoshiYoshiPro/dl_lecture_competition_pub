@@ -1,20 +1,23 @@
 import torch
+import torch.nn.functional as F
 import hydra
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 import random
 import numpy as np
 from src.models.evflownet import EVFlowNet
-from src.datasets import DatasetProvider
+from src.datasets import DatasetProvider, efficient_train_collate
+from src.utils import compute_epe_error, compute_multiscale_loss, total_loss
 from enum import Enum, auto
-from src.datasets import train_collate
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import os
 import time
 import matplotlib.pyplot as plt
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import logging
+from concurrent.futures import ThreadPoolExecutor
 
 class RepresentationType(Enum):
     VOXEL = auto()
@@ -28,176 +31,159 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
 
-def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
-    '''
-    end-point-error (ground truthと予測値の二乗誤差)を計算
-    pred_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 予測したオプティカルフローデータ
-    gt_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 正解のオプティカルフローデータ
-    '''
-    epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
-    return epe
-
 def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
-    '''
-    optical flowをnpyファイルに保存
-    flow: torch.Tensor, Shape: torch.Size([2, 480, 640]) => オプティカルフローデータ
-    file_name: str => ファイル名
-    '''
     np.save(f"{file_name}.npy", flow.cpu().numpy())
-    
-    
-def compute_multiscale_loss(pred_flows, gt_flow, gt_valid_mask):
-    total_loss = 0
-    weights = [0.32, 0.08, 0.02, 0.01]  # 各スケールの重み
-    for i, pred_flow in enumerate(pred_flows):
-        scale = 2 ** (3 - i)
-        scaled_gt_flow = F.interpolate(gt_flow, scale_factor=1/scale, mode='bilinear', align_corners=False)
-        scaled_gt_valid_mask = F.interpolate(gt_valid_mask.float(), scale_factor=1/scale, mode='nearest').bool()
-        loss = compute_epe_error(pred_flow, scaled_gt_flow) * weights[i]
-        total_loss += loss
-    return total_loss
-
 
 @hydra.main(version_base=None, config_path="configs", config_name="base")
 def main(args: DictConfig):
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    '''
-        ディレクトリ構造:
+    logger.info(f"Using device: {device}")
 
-        data
-        ├─test
-        |  ├─test_city
-        |  |    ├─events_left
-        |  |    |   ├─events.h5
-        |  |    |   └─rectify_map.h5
-        |  |    └─forward_timestamps.txt
-        └─train
-            ├─zurich_city_11_a
-            |    ├─events_left
-            |    |       ├─ events.h5
-            |    |       └─ rectify_map.h5
-            |    ├─ flow_forward
-            |    |       ├─ 000134.png
-            |    |       |.....
-            |    └─ forward_timestamps.txt
-            ├─zurich_city_11_b
-            └─zurich_city_11_c
-        '''
-    
-    # ------------------
-    #    Dataloader
-    # ------------------
-    loader = DatasetProvider(
-        dataset_path=Path(args.dataset_path),
-        representation_type=RepresentationType.VOXEL,
-        delta_t_ms=100,
-        num_bins=4
-    )
-    train_set = loader.get_train_dataset()
-    test_set = loader.get_test_dataset()
-    collate_fn = train_collate
-    train_data = DataLoader(train_set,
-                                 batch_size=args.data_loader.train.batch_size,
-                                 shuffle=args.data_loader.train.shuffle,
-                                 collate_fn=collate_fn,
-                                 drop_last=False)
-    test_data = DataLoader(test_set,
-                                 batch_size=args.data_loader.test.batch_size,
-                                 shuffle=args.data_loader.test.shuffle,
-                                 collate_fn=collate_fn,
-                                 drop_last=False)
+    # Dataloader
+    try:
+        loader = DatasetProvider(
+            dataset_path=Path(args.dataset_path),
+            representation_type=RepresentationType.VOXEL,
+            delta_t_ms=100,
+            num_bins=4,
+            val_split=args.val_split
+        )
+        train_set = loader.get_train_dataset()
+        val_set = loader.get_val_dataset()
+        test_set = loader.get_test_dataset()
+    except Exception as e:
+        logger.error(f"Error in data loading: {str(e)}")
+        return
 
-    '''
-    train data:
-        Type of batch: Dict
-        Key: seq_name, Type: list
-        Key: event_volume, Type: torch.Tensor, Shape: torch.Size([Batch, 4, 480, 640]) => イベントデータのバッチ
-        Key: flow_gt, Type: torch.Tensor, Shape: torch.Size([Batch, 2, 480, 640]) => オプティカルフローデータのバッチ
-        Key: flow_gt_valid_mask, Type: torch.Tensor, Shape: torch.Size([Batch, 1, 480, 640]) => オプティカルフローデータのvalid. ベースラインでは使わない
-    
-    test data:
-        Type of batch: Dict
-        Key: seq_name, Type: list
-        Key: event_volume, Type: torch.Tensor, Shape: torch.Size([Batch, 4, 480, 640]) => イベントデータのバッチ
-    '''
-    # ------------------
-    #       Model
-    # ------------------
+    train_data = DataLoader(train_set, batch_size=args.data_loader.train.batch_size,
+                            shuffle=args.data_loader.train.shuffle, collate_fn=efficient_train_collate)
+    val_data = DataLoader(val_set, batch_size=args.data_loader.train.batch_size,
+                          shuffle=False, collate_fn=efficient_train_collate) if val_set else None
+    test_data = DataLoader(test_set, batch_size=args.data_loader.test.batch_size,
+                           shuffle=False, collate_fn=efficient_train_collate)
+
+    # Model
     model = EVFlowNet(args.train).to(device)
 
-    # ------------------
-    #   optimizer
-    # ------------------
+    # Optimizer and Scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
-    # ------------------
-    #   Start training
-    # ------------------
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=args.train.lr_factor, patience=args.train.lr_patience, verbose=True)
+
+    # Training
     epoch_losses = []
-    model.train()
+    val_losses = []
+    best_val_loss = float('inf')
+    patience = args.train.patience
+    no_improve_epochs = 0
+    best_model_path = None
+
     for epoch in range(args.train.epochs):
-        total_loss = 0
-        print("on epoch: {}".format(epoch+1))
-        for i, batch in enumerate(tqdm(train_data)):
-            batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device)
+        model.train()
+        train_loss = 0
+        for batch in tqdm(train_data, desc=f"Epoch {epoch+1}/{args.train.epochs}"):
+            event_images = [img.to(device) for img in batch['event_volume_multi']]
+            pred_flows = model(event_images)
             ground_truth_flow = batch["flow_gt"].to(device)
-            flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
-            print(f"batch {i} loss: {loss.item()}")
+            ground_truth_valid_mask = batch["flow_gt_valid_mask"].to(device)
+            
             optimizer.zero_grad()
+            pred_flows = model(event_images)
+            loss = total_loss(pred_flows, ground_truth_flow, ground_truth_valid_mask, smooth_weight=args.train.smooth_weight)
             loss.backward()
             optimizer.step()
+            
+            train_loss += loss.item()
 
-            total_loss += loss.item()
+        train_loss /= len(train_data)
+        epoch_losses.append(train_loss)
+        
+        # Validation
+        if val_data:
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch in tqdm(val_data, desc="Validation"):
+                    event_images = [img.to(device) for img in batch['event_volume_multi']]
+                    ground_truth_flow = batch["flow_gt"].to(device)
+                    ground_truth_valid_mask = batch["flow_gt_valid_mask"].to(device)
+                    
+                    pred_flows = model(event_images)
+                    loss = total_loss(pred_flows, ground_truth_flow, ground_truth_valid_mask, smooth_weight=args.train.smooth_weight)
+                    val_loss += loss.item()
+            
+            val_loss /= len(val_data)
+            val_losses.append(val_loss)
+            scheduler.step(val_loss)
+            
+            logger.info(f"Epoch {epoch+1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                no_improve_epochs = 0
+                if not os.path.exists('checkpoints'):
+                    os.makedirs('checkpoints')              
+                best_model_path = f"checkpoints/best_model_{time.strftime('%Y%m%d%H%M%S')}.pth"
+                torch.save(model.state_dict(), best_model_path)
 
-        avg_loss = total_loss / len(train_data)
-        epoch_losses.append(avg_loss)
-        print(f'Epoch {epoch+1}, Average Loss: {avg_loss}')
+            else:
+                no_improve_epochs += 1
+            
+            if no_improve_epochs >= patience:
+                logger.info(f"Early stopping at epoch {epoch+1}")
+                break
+        else:
+            logger.info(f"Epoch {epoch+1}, Train Loss: {train_loss:.4f}")
 
-    # Create the directory if it doesn't exist
-    if not os.path.exists('checkpoints'):
-        os.makedirs('checkpoints')
-    
-    current_time = time.strftime("%Y%m%d%H%M%S")
-    model_path = f"checkpoints/model_{current_time}.pth"
-    torch.save(model.state_dict(), model_path)
-    print(f"Model saved to {model_path}")
-
-    # ------------------
-    #   Start predicting
-    # ------------------
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    # Testing
+    if best_model_path:
+        model.load_state_dict(torch.load(best_model_path))
     model.eval()
-    flow: torch.Tensor = torch.tensor([]).to(device)
+    test_loss = 0
+    flow_predictions = []
     with torch.no_grad():
-        print("start test")
-        for batch in tqdm(test_data):
-            batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device)
-            batch_flow = model(event_image) # [1, 2, 480, 640]
-            flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
-        print("test done")
-    # ------------------
-    #  save submission
-    # ------------------
-    file_name = "submission"
-    save_optical_flow_to_npy(flow, file_name)
-    
-    # トレーニング終了後に損失をプロット
+        for batch in tqdm(test_data, desc="Testing"):
+            event_images = [img.to(device) for img in batch['event_volume_multi']]
+            pred_flows = model(event_images)
+            flow_predictions.append(pred_flows[-1].cpu())  # 最終スケールの予測を使用
+
+            if 'flow_gt' in batch:
+                ground_truth_flow = batch["flow_gt"].to(device)
+                ground_truth_valid_mask = batch["flow_gt_valid_mask"].to(device)
+                loss = compute_epe_error(pred_flows[-1], ground_truth_flow, ground_truth_valid_mask)
+                test_loss += loss.item()
+
+    if 'flow_gt' in batch:
+        test_loss /= len(test_data)
+        logger.info(f"Test Loss: {test_loss:.4f}")
+
+    # Save predictions
+    flow_predictions = torch.cat(flow_predictions, dim=0)
+    save_optical_flow_to_npy(flow_predictions, "submission")
+
+    # Plot and save training and validation loss
     plt.figure(figsize=(10, 5))
-    plt.plot(range(1, len(epoch_losses) + 1), epoch_losses, marker='o')
-    plt.title('Training Loss per Epoch')
+    plt.plot(range(1, len(epoch_losses) + 1), epoch_losses, marker='o', label='Train Loss')
+    if val_losses:
+        plt.plot(range(1, len(val_losses) + 1), val_losses, marker='s', label='Validation Loss')
+    plt.title('Training and Validation Loss per Epoch')
     plt.xlabel('Epoch')
     plt.ylabel('Average Loss')
+    plt.legend()
     plt.grid(True)
-    plt.savefig('training_loss.png')
+    plt.savefig('training_validation_loss.png')
     plt.close()
-    
-    # 損失の値をテキストファイルに保存
-    with open('training_loss.txt', 'w') as f:
-        for epoch, loss in enumerate(epoch_losses, 1):
-            f.write(f'Epoch {epoch}: {loss}\n')
+
+    # Save loss values to text file
+    with open('training_validation_loss.txt', 'w') as f:
+        for epoch, train_loss in enumerate(epoch_losses, 1):
+            line = f'Epoch {epoch}: Train Loss: {train_loss}'
+            if val_losses:
+                line += f', Val Loss: {val_losses[epoch-1]}'
+            f.write(line + '\n')
 
 if __name__ == "__main__":
     main()
