@@ -1,27 +1,29 @@
 import math
-from pathlib import Path, PurePath
-from typing import Dict, Tuple
-from time import time
-import cv2
-import hdf5plugin
-import h5py
-from numba import jit
-import numpy as np
 import os
+from pathlib import Path, PurePath
+from time import time
+from typing import Dict, Tuple
+
+import cv2
+import h5py
+import hdf5plugin
 import imageio
+import numpy as np
+from numba import jit
+
 imageio.plugins.freeimage.download()
-import imageio.v3 as iio
-import torch
-import torch.utils.data
-from torchvision.transforms import RandomCrop
-import torch.nn.functional as F
-from torchvision import transforms as T
-from torchvision.transforms import functional as TF
-from torch.utils.data import Dataset
 import random
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
+import imageio.v3 as iio
+import torch
+import torch.nn.functional as F
+import torch.utils.data
+from torch.utils.data import Dataset
+from torchvision import transforms as T
+from torchvision.transforms import RandomCrop
+from torchvision.transforms import functional as TF
 
 from src.utils import RepresentationType, VoxelGrid, flow_16bit_to_float
 
@@ -258,7 +260,7 @@ class Sequence(Dataset):
         self.load_gt = load_gt if mode == 'train' else False
         self.transforms = transforms
         self.augmentation = EventDataAugmentation() if mode == 'train' else None
-        
+
         if self.mode == "test":
             assert load_gt == False
             # Get Test Timestamp File
@@ -364,7 +366,7 @@ class Sequence(Dataset):
         assert x.max() < self.width
         assert y.max() < self.height
         return rectify_map[y, x]
-    
+
     def get_data(self, index) -> Dict[str, any]:
         ts_start: int = self.timestamps_flow[index] - self.delta_t_us
         ts_end: int = self.timestamps_flow[index]
@@ -397,7 +399,7 @@ class Sequence(Dataset):
                 p, t, x_rect, y_rect)
             output['event_volume'] = event_representation
         output['name_map'] = self.name_idx
-        
+
         if self.load_gt:
             output['flow_gt'
                 ] = [torch.tensor(x) for x in self.load_flow(self.flow_png[index])]
@@ -415,10 +417,10 @@ class Sequence(Dataset):
             sample = self.get_data(idx)
             if len(self.event_data_cache) < self.max_cache_size:
                 self.event_data_cache[idx] = sample
-        
+
         if self.augmentation:
             sample = self.augmentation(sample)
-        
+
         # マルチスケール入力のサポート
         event_volume = sample['event_volume']
         sample['event_volume_multi'] = [
@@ -426,10 +428,10 @@ class Sequence(Dataset):
             F.avg_pool2d(event_volume, 2),
             F.avg_pool2d(event_volume, 4)
         ]
-        
+
         return sample
 
-    
+
     def get_voxel_grid(self, idx):
 
         if idx == 0:
@@ -505,7 +507,6 @@ class Sequence(Dataset):
             else:
                 event_count[mask] = event_count[mask] - mean
         return event_count
-    
 
 
 class SequenceRecurrent(Sequence):
@@ -580,7 +581,7 @@ class SequenceRecurrent(Sequence):
             i, j, h, w = RandomCrop.get_params(
                 sample["event_volume_old"], output_size=self.crop_size)
             keys_to_crop = ["event_volume_old", "event_volume_new",
-                            "flow_gt_event_volume_old", "flow_gt_event_volume_new", 
+                            "flow_gt_event_volume_old", "flow_gt_event_volume_new",
                             "flow_gt_next",]
 
             for sample in sequence:
@@ -609,16 +610,16 @@ class DatasetProvider:
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
             # テストシーケンスの作成
             test_sequences = list(executor.map(
-                partial(self.create_sequence, 
+                partial(self.create_sequence,
                         representation_type=representation_type,
-                        mode='test', 
-                        delta_t_ms=delta_t_ms, 
+                        mode='test',
+                        delta_t_ms=delta_t_ms,
                         num_bins=num_bins,
                         visualize=visualize,
                         load_gt=False),
                 test_path.iterdir()
             ))
-            
+
             # トレーニングシーケンスの作成
             available_seqs = os.listdir(train_path)
             train_sequences = list(executor.map(
@@ -649,8 +650,8 @@ class DatasetProvider:
             self.val_dataset = None
 
         self.train_dataset = torch.utils.data.ConcatDataset(train_sequences)
-        
-        
+
+
     @staticmethod
     def create_sequence(path, **kwargs):
         return Sequence(path, **kwargs)
@@ -710,12 +711,12 @@ def rec_train_collate(sample_list):
 # データローダーの効率化
 def efficient_train_collate(sample_list):
     batch = {
-        'event_volume_multi': [torch.stack([sample['event_volume_multi'][i] for sample in sample_list]) 
+        'event_volume_multi': [torch.stack([sample['event_volume_multi'][i] for sample in sample_list])
                                for i in range(3)]
     }
-    
+
     if 'flow_gt' in sample_list[0]:
         batch['flow_gt'] = torch.stack([sample['flow_gt'][0] for sample in sample_list])
         batch['flow_gt_valid_mask'] = torch.stack([sample['flow_gt'][1] for sample in sample_list])
-    
+
     return batch

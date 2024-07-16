@@ -1,8 +1,11 @@
+from typing import Any, Dict, List
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+
 from src.models.base import *
-from typing import List, Dict, Any
+
 
 class EVFlowNet(nn.Module):
     def __init__(self, args):
@@ -46,7 +49,7 @@ class EVFlowNet(nn.Module):
         skip_connections = []
         for i, encoder in enumerate([self.encoder1, self.encoder2, self.encoder3, self.encoder4]):
             x = encoder(x)
-            if i < 3:  # don't save skip connection for last encoder layer
+            if i < 3:
                 skip_connections.append(x)
             if i < len(inputs) - 1:
                 resized_input = F.interpolate(inputs[i+1], size=x.shape[2:], mode='bilinear', align_corners=False)

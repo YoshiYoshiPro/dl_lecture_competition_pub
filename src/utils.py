@@ -1,10 +1,12 @@
 import random
-import numpy as np
-import torch
-import torch.nn.functional as F
 from enum import Enum, auto
 from time import time
 from typing import Dict, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
 
 def set_seed(seed: int = 0) -> None:
     random.seed(seed)
@@ -122,7 +124,6 @@ def flow_16bit_to_float(flow_16bit: np.ndarray) -> Tuple[np.ndarray, np.ndarray]
 def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor, valid_mask: torch.Tensor = None):
     epe = torch.norm(pred_flow - gt_flow, p=2, dim=1)
     if valid_mask is not None:
-        # Ensure valid_mask has the same shape as epe
         valid_mask = valid_mask.squeeze(1) if valid_mask.dim() == 4 else valid_mask
         valid_mask = valid_mask.expand_as(epe)
         epe = epe[valid_mask]
@@ -141,12 +142,12 @@ def warp_images(img: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     xx = xx.view(1,1,H,W).repeat(B,1,1,1)
     yy = yy.view(1,1,H,W).repeat(B,1,1,1)
     grid = torch.cat((xx,yy),1).float().to(img.device)
-    
+
     vgrid = grid + flow
-    
+
     vgrid[:,0,:,:] = 2.0*vgrid[:,0,:,:].clone() / max(W-1,1)-1.0
     vgrid[:,1,:,:] = 2.0*vgrid[:,1,:,:].clone() / max(H-1,1)-1.0
-    
+
     vgrid = vgrid.permute(0,2,3,1)
     output = F.grid_sample(img, vgrid, align_corners=True)
     return output
@@ -158,11 +159,10 @@ def compute_multiscale_loss(pred_flows, gt_flow, gt_valid_mask):
         scale = 2 ** (3 - i)
         scaled_gt_flow = F.interpolate(gt_flow, scale_factor=1/scale, mode='bilinear', align_corners=False)
         scaled_gt_valid_mask = F.interpolate(gt_valid_mask.float(), scale_factor=1/scale, mode='nearest').bool()
-        
-        # Ensure pred_flow and scaled_gt_flow have the same shape
+
         if pred_flow.shape != scaled_gt_flow.shape:
             pred_flow = F.interpolate(pred_flow, size=scaled_gt_flow.shape[2:], mode='bilinear', align_corners=False)
-        
+
         loss = compute_epe_error(pred_flow, scaled_gt_flow, scaled_gt_valid_mask) * weights[i]
         total_loss += loss
     return total_loss

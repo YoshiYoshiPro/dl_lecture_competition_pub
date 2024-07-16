@@ -1,23 +1,26 @@
+import logging
+import os
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
+from enum import Enum, auto
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import hydra
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
-import hydra
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader
-import random
-import numpy as np
-from src.models.evflownet import EVFlowNet
-from src.datasets import DatasetProvider, efficient_train_collate
-from src.utils import compute_epe_error, compute_multiscale_loss, total_loss
-from enum import Enum, auto
-from tqdm import tqdm
-from pathlib import Path
-from typing import Dict, Any, Optional
-import os
-import time
-import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-import logging
-from concurrent.futures import ThreadPoolExecutor
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from src.datasets import DatasetProvider, efficient_train_collate
+from src.models.evflownet import EVFlowNet
+from src.utils import compute_epe_error, compute_multiscale_loss, total_loss
+
 
 class RepresentationType(Enum):
     VOXEL = auto()
@@ -89,18 +92,18 @@ def main(args: DictConfig):
             pred_flows = model(event_images)
             ground_truth_flow = batch["flow_gt"].to(device)
             ground_truth_valid_mask = batch["flow_gt_valid_mask"].to(device)
-            
+
             optimizer.zero_grad()
             pred_flows = model(event_images)
             loss = total_loss(pred_flows, ground_truth_flow, ground_truth_valid_mask, smooth_weight=args.train.smooth_weight)
             loss.backward()
             optimizer.step()
-            
+
             train_loss += loss.item()
 
         train_loss /= len(train_data)
         epoch_losses.append(train_loss)
-        
+
         # Validation
         if val_data:
             model.eval()
@@ -110,28 +113,28 @@ def main(args: DictConfig):
                     event_images = [img.to(device) for img in batch['event_volume_multi']]
                     ground_truth_flow = batch["flow_gt"].to(device)
                     ground_truth_valid_mask = batch["flow_gt_valid_mask"].to(device)
-                    
+
                     pred_flows = model(event_images)
                     loss = total_loss(pred_flows, ground_truth_flow, ground_truth_valid_mask, smooth_weight=args.train.smooth_weight)
                     val_loss += loss.item()
-            
+
             val_loss /= len(val_data)
             val_losses.append(val_loss)
             scheduler.step(val_loss)
-            
+
             logger.info(f"Epoch {epoch+1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-            
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 no_improve_epochs = 0
                 if not os.path.exists('checkpoints'):
-                    os.makedirs('checkpoints')              
+                    os.makedirs('checkpoints')
                 best_model_path = f"checkpoints/best_model_{time.strftime('%Y%m%d%H%M%S')}.pth"
                 torch.save(model.state_dict(), best_model_path)
 
             else:
                 no_improve_epochs += 1
-            
+
             if no_improve_epochs >= patience:
                 logger.info(f"Early stopping at epoch {epoch+1}")
                 break
@@ -148,7 +151,7 @@ def main(args: DictConfig):
         for batch in tqdm(test_data, desc="Testing"):
             event_images = [img.to(device) for img in batch['event_volume_multi']]
             pred_flows = model(event_images)
-            flow_predictions.append(pred_flows[-1].cpu())  # 最終スケールの予測を使用
+            flow_predictions.append(pred_flows[-1].cpu())
 
             if 'flow_gt' in batch:
                 ground_truth_flow = batch["flow_gt"].to(device)
